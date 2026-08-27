@@ -57,7 +57,7 @@ func TestFlattenRoles_OpenAI_SystemAndTool(t *testing.T) {
 	}
 }
 
-func TestFlattenRoles_Anthropic_SystemFieldUntouched(t *testing.T) {
+func TestFlattenRoles_Anthropic_SystemMovedToMessages(t *testing.T) {
 	body := `{
 		"model": "claude-sonnet-4-20250514",
 		"system": "You are a helpful assistant.",
@@ -77,23 +77,49 @@ func TestFlattenRoles_Anthropic_SystemFieldUntouched(t *testing.T) {
 	var result map[string]json.RawMessage
 	json.Unmarshal(out, &result)
 
-	// System field should be preserved as-is
-	var sys string
-	json.Unmarshal(result["system"], &sys)
-	if sys != "You are a helpful assistant." {
-		t.Errorf("system field modified: got %q", sys)
+	// System field should be removed from top level
+	if _, hasSys := result["system"]; hasSys {
+		t.Error("system field should have been removed from top level")
 	}
 
 	var msgs []map[string]json.RawMessage
 	json.Unmarshal(result["messages"], &msgs)
 
-	expectedRoles := []string{"user", "assistant", "user"}
+	// System content becomes a leading user message
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages (system hoisted + 3 original), got %d", len(msgs))
+	}
+
+	expectedRoles := []string{"user", "user", "assistant", "user"}
 	for i, msg := range msgs {
 		var role string
 		json.Unmarshal(msg["role"], &role)
 		if role != expectedRoles[i] {
 			t.Errorf("message %d: got role %q, want %q", i, role, expectedRoles[i])
 		}
+	}
+
+	// First message should contain the system content
+	var content string
+	json.Unmarshal(msgs[0]["content"], &content)
+	if content != "You are a helpful assistant." {
+		t.Errorf("hoisted system content = %q, want %q", content, "You are a helpful assistant.")
+	}
+}
+
+func TestFlattenRoles_Anthropic_NoSystemField(t *testing.T) {
+	body := `{
+		"model": "claude-sonnet-4-20250514",
+		"messages": [
+			{"role": "user", "content": "Hello"},
+			{"role": "assistant", "content": "Hi!"}
+		],
+		"max_tokens": 1024
+	}`
+
+	_, changed := flattenRoles([]byte(body))
+	if changed {
+		t.Error("expected no change when no system field and only user/assistant roles")
 	}
 }
 
