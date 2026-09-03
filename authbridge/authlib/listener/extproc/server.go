@@ -241,6 +241,7 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 		At:          time.Now(),
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionRequest,
+		RequestID:   pctx.RequestID(),
 		A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 		Plugins:     plugins,
@@ -279,6 +280,7 @@ func (s *Server) recordInboundReject(pctx *pipeline.Context, action pipeline.Act
 		At:          time.Now(),
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionDenied,
+		RequestID:   pctx.RequestID(),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 		Plugins:     pipeline.SnapshotPlugins(pctx.Extensions.Custom),
 		Identity:    pipeline.SnapshotIdentity(pctx),
@@ -332,6 +334,7 @@ func (s *Server) recordOutboundReject(pctx *pipeline.Context, action pipeline.Ac
 		At:          time.Now(),
 		Direction:   pipeline.Outbound,
 		Phase:       pipeline.SessionDenied,
+		RequestID:   pctx.RequestID(),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 		Plugins:     pipeline.SnapshotPlugins(pctx.Extensions.Custom),
 		Identity:    pipeline.SnapshotIdentity(pctx),
@@ -371,6 +374,7 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 		At:          time.Now(),
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionResponse,
+		RequestID:   pctx.RequestID(),
 		A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
 		Plugins:     plugins,
@@ -399,6 +403,7 @@ func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
 		At:          time.Now(),
 		Direction:   pipeline.Outbound,
 		Phase:       pipeline.SessionResponse,
+		RequestID:   pctx.RequestID(),
 		MCP:         pipeline.SnapshotMCP(pctx.Extensions.MCP),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
@@ -446,6 +451,7 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 		At:          time.Now(),
 		Direction:   pipeline.Outbound,
 		Phase:       pipeline.SessionRequest,
+		RequestID:   pctx.RequestID(),
 		MCP:         pipeline.SnapshotMCP(pctx.Extensions.MCP),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
@@ -657,7 +663,7 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 		s.recordOutboundResponseSession(pctx)
 	}
 
-	// A plugin that declared WritesBody: true and called pctx.SetResponseBody
+	// A plugin that declared WritesResponseBody: true and called pctx.SetResponseBody
 	// flips the ResponseBodyMutated flag. Emit the replacement bytes via
 	// BodyMutation so Envoy rewrites the downstream response; otherwise
 	// pass through with no mutation. The flag avoids the O(n) string
@@ -669,6 +675,10 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 			Response: &extprocv3.ProcessingResponse_ResponseBody{
 				ResponseBody: &extprocv3.BodyResponse{
 					Response: &extprocv3.CommonResponse{
+						HeaderMutation: &extprocv3.HeaderMutation{
+							SetHeaders:    []*corev3.HeaderValueOption{contentLength(pctx.ResponseBody)},
+							RemoveHeaders: []string{"content-encoding"},
+						},
 						BodyMutation: &extprocv3.BodyMutation{
 							Mutation: &extprocv3.BodyMutation_Body{
 								Body: pctx.ResponseBody,
@@ -840,8 +850,9 @@ func passBodyResponse() *extprocv3.ProcessingResponse {
 
 // withBodyMutation optionally decorates a RequestBody ProcessingResponse
 // with an ext_proc BodyMutation when the pipeline rewrote pctx.Body.
-// Envoy replaces the buffered body with the new bytes and recomputes
-// Content-Length for the upstream. We also clear content-encoding
+// Envoy replaces the buffered body with the new bytes but, in BUFFERED +
+// SEND mode, leaves content-length to the processor (processing_mode.proto,
+// BodySendMode) and rejects a mismatch. We also clear content-encoding
 // because the plugin may have decompressed + rewritten in plaintext;
 // shipping plain bytes without the old encoding header is safer than
 // shipping a malformed archive.
@@ -867,7 +878,14 @@ func withBodyMutation(resp *extprocv3.ProcessingResponse, pctx *pipeline.Context
 		cr.HeaderMutation = &extprocv3.HeaderMutation{}
 	}
 	cr.HeaderMutation.RemoveHeaders = append(cr.HeaderMutation.RemoveHeaders, "content-encoding")
+	cr.HeaderMutation.SetHeaders = append(cr.HeaderMutation.SetHeaders, contentLength(pctx.Body))
 	return resp
+}
+
+// contentLength is the SetHeaders entry a body-mutation reply must carry in
+// BUFFERED + SEND mode (processing_mode.proto, BodySendMode).
+func contentLength(body []byte) *corev3.HeaderValueOption {
+	return &corev3.HeaderValueOption{Header: &corev3.HeaderValue{Key: "content-length", RawValue: []byte(strconv.Itoa(len(body)))}}
 }
 
 func allowBodyResponse() *extprocv3.ProcessingResponse {

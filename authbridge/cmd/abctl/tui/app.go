@@ -71,6 +71,19 @@ const maxEventsPerSession = 1000
 // confirmation) stays in the footer.
 const flashDuration = 3 * time.Second
 
+// localEndpoint is the address `[l]` from the Namespaces pane connects
+// to: the session API's default port on the local host. Useful when the
+// operator already has their own `kubectl port-forward` running, when
+// abctl runs inside the mesh, or when the cluster's pod list isn't
+// visible to their kubeconfig but a tunnel is.
+const localEndpoint = "http://localhost:9094"
+
+// localProbeTimeout bounds the pre-connect reachability check for `[l]`.
+// Without it, a dead localEndpoint would leave the operator in an empty
+// session view wondering why nothing streams; with it they get a footer
+// error and stay in the picker.
+const localProbeTimeout = 2 * time.Second
+
 // refreshInterval is how often abctl re-fetches /v1/sessions from the
 // server to reconcile its local list. Cheap, and the only mechanism by
 // which rekeys (default → contextId) propagate to the client UI — the
@@ -236,6 +249,20 @@ type model struct {
 	// until then.
 	pipeline *apiclient.PipelineView
 
+	// pipelineFetching is set while a /v1/pipeline request is outstanding, so
+	// the 2s refresh tick cannot stack fetches against a slow endpoint.
+	pipelineFetching bool
+
+	// helpVisible toggles the [?] key-help overlay. Deliberately a flag
+	// rather than a paneID: the overlay must be openable over ANY pane
+	// (picker included) without disturbing m.pane / m.previousPane, which
+	// the catalog's Esc-return already owns.
+	helpVisible bool
+	// helpVp scrolls the help overlay's body. Its own viewport rather than
+	// a shared one because the overlay can open over the detail panes,
+	// which would otherwise have their scroll position clobbered.
+	helpVp viewport.Model
+
 	// catalog is the registered-plugin catalog from /v1/plugins,
 	// fetched lazily when the user first opens the catalog pane via
 	// `P`. Cached for the session; `r` from the catalog pane refreshes.
@@ -270,6 +297,12 @@ type model struct {
 	// activePF is the live port-forward tunnel, if any. Closed on pod-switch
 	// or quit.
 	activePF cluster.PortForward
+
+	// localDirect is true when the session view was entered via `[l]`
+	// (direct connection to localEndpoint) rather than by picking a pod.
+	// There is no pod to go back to, so Esc returns to the Namespaces
+	// pane instead of Pods.
+	localDirect bool
 
 	// editState tracks an in-flight pipeline edit (the "e" flow).
 	// editState.phase == editPhaseDone means no edit is active.
@@ -331,6 +364,9 @@ func (m *model) initSessionView() tea.Cmd {
 // is preserved so the user picks a different pod immediately. A fresh
 // ctx / cancel is derived from m.parentCtx so the next session-view
 // entry has a usable context.
+//
+// When the session was entered via `[l]` there is no pod to return to,
+// so the destination is the Namespaces pane instead.
 func (m *model) backToPodsPane() {
 	// Cancel current ctx — stops the SSE goroutine and any in-flight
 	// session/pipeline fetches.
@@ -370,7 +406,31 @@ func (m *model) backToPodsPane() {
 	// Re-derive ctx for the next session view.
 	m.ctx, m.cancel = context.WithCancel(m.parentCtx)
 
+	if m.localDirect {
+		// Entered via `[l]`: no pod was ever selected, so the Pods pane
+		// would render an empty table for a namespace the user never
+		// picked. Go back to where they actually were.
+		m.localDirect = false
+		m.pane = paneNamespaces
+		return
+	}
 	m.pane = panePods
+}
+
+// syncHelpViewport (re)builds the help overlay's content and sizes its
+// viewport to the current terminal. Called when the overlay opens and on
+// every resize while it's open, so the body re-wraps and the scroll range
+// stays correct. resetScroll is true only on open — a resize should keep
+// the reader where they were.
+func (m *model) syncHelpViewport(resetScroll bool) {
+	body := helpBodyLines(m.pane)
+	w, h := helpViewportSize(m.width, m.height, helpBodyWidth(body))
+	m.helpVp.Width = w
+	m.helpVp.Height = h
+	m.helpVp.SetContent(body)
+	if resetScroll {
+		m.helpVp.GotoTop()
+	}
 }
 
 // Init fires the initial fetch + starts the SSE pump and the tick.
@@ -384,13 +444,18 @@ func (m *model) Init() tea.Cmd {
 	return m.initSessionView()
 }
 
-// loadPipelineCmd fetches /v1/pipeline once at startup. The pipeline is
-// static for the duration of a process so there's no periodic refresh.
+// loadPipelineCmd fetches /v1/pipeline. The plugin composition is static for
+// the life of a process, but the view also carries each plugin's live
+// Metrics counters — so a single fetch at startup would freeze them at zero,
+// which on a fresh proxy is every number a user ever sees. It is refetched
+// when a metrics-bearing pane is open; see refreshTickMsg.
 func (m *model) loadPipelineCmd() tea.Cmd {
 	return func() tea.Msg {
 		pv, err := m.client.GetPipeline(m.ctx)
 		if err != nil {
-			return errMsg{where: "get pipeline", err: err}
+			// Report as a load with no view so the in-flight flag clears; a
+			// failure that left it set would wedge refresh for the session.
+			return pipelineLoadedMsg(nil)
 		}
 		return pipelineLoadedMsg(pv)
 	}
@@ -470,6 +535,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.layout()
+		// Re-size the help body too if it's currently up, preserving the
+		// reader's scroll position.
+		if m.helpVisible {
+			m.syncHelpViewport(false)
+		}
 		return m, nil
 
 	case tickMsg:
@@ -522,11 +592,35 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pane == paneNamespaces || m.pane == panePods {
 			return m, refreshTickCmd()
 		}
+		// Refresh the pipeline view too while a pane that displays plugin
+		// Metrics is open, so counters tick rather than sitting at whatever
+		// they were when the session was first opened. Skipped elsewhere:
+		// the composition itself does not change, so polling it while nobody
+		// is looking at metrics would be pure overhead.
+		// Guard against stacking fetches: the tick is 2s and the HTTP timeout is
+		// 10s, so a stalled endpoint would otherwise accumulate ~5 concurrent
+		// requests and keep adding one every tick.
+		if (m.pane == panePluginDetail || m.pane == panePipeline) && !m.pipelineFetching {
+			m.pipelineFetching = true
+			return m, tea.Batch(m.loadSessionsCmd(), m.loadPipelineCmd(), refreshTickCmd())
+		}
 		return m, tea.Batch(m.loadSessionsCmd(), refreshTickCmd())
 
 	case pipelineLoadedMsg:
+		m.pipelineFetching = false
+		if msg == nil {
+			return m, nil // fetch failed; keep the view we have
+		}
 		m.pipeline = (*apiclient.PipelineView)(msg)
 		m.rebuildPipelineTable()
+		// Re-render an open plugin detail pane against the new view. Without
+		// this the pane keeps showing the snapshot it was opened with, so
+		// Metrics would still read (none) however long traffic ran.
+		if m.pane == panePluginDetail && m.detailPlugin != nil {
+			if p := m.livePipelinePlugin(m.detailPlugin); p != nil {
+				m.showPluginDetail(p)
+			}
+		}
 		return m, nil
 
 	case catalogLoadedMsg:
@@ -614,6 +708,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case localConnectedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.pickerErr = "localhost:9094: " + msg.err.Error()
+			return m, nil
+		}
+		m.pickerErr = ""
+		// No port-forward subprocess and no pod identity: this is a
+		// direct connection to whatever is already listening locally.
+		// activePF stays nil (nothing to tear down) and selectedPod /
+		// selectedNamespace stay empty, so `e` correctly reports that
+		// pipeline editing needs the picker — same as --endpoint mode.
+		m.endpoint = msg.endpoint
+		m.client = msg.client
+		m.localDirect = true
+		m.pane = paneSessions
+		return m, m.initSessionView()
 
 	case portForwardReadyMsg:
 		if msg.err != nil {
@@ -901,8 +1013,19 @@ sortAndRebuild:
 	}
 }
 
-// View composes the full screen.
+// View composes the full screen. The [?] key-help overlay is layered on
+// top of whatever the pane rendered, so it works over the picker and the
+// session views alike.
 func (m *model) View() string {
+	base := m.paneView()
+	if m.helpVisible {
+		return overlayCenter(base, renderHelpOverlay(m.helpVp, m.width, m.height), m.width, m.height)
+	}
+	return base
+}
+
+// paneView renders the active pane without the help overlay.
+func (m *model) paneView() string {
 	// Edit overlay takes over the screen while an edit is in flight.
 	// editPhaseBackground intentionally falls through — the user backed
 	// out and wants the normal UI back; flash messages handle reporting.
@@ -918,11 +1041,12 @@ func (m *model) View() string {
 		if m.namespaces != nil && len(m.namespaces) == 0 && m.pickerErr == "" {
 			body = styleHint.Render(
 				"No AuthBridge agents found in this cluster.\n" +
-					"Use `abctl --endpoint http://...` to connect to a session API directly.")
+					"Press [l] to connect to " + localEndpoint + " (an existing\n" +
+					"port-forward), or use `abctl --endpoint http://...`.")
 		} else {
 			body = m.namespacesTbl.View()
 		}
-		footer := "[↑↓/jk] nav  [↵] open  [r] reload  [q] quit"
+		footer := m.helpView()
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
@@ -935,7 +1059,7 @@ func (m *model) View() string {
 	if m.pane == panePods {
 		title := "abctl · " + m.selectedNamespace + " · pick pod"
 		body := m.podsTbl.View()
-		footer := "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  [q] quit"
+		footer := m.helpView()
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
